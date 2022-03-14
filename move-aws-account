@@ -1,0 +1,271 @@
+#!/bin/sh
+#
+# Move an AWS account to an OU
+#
+# 20180808  Kimmo Suominen
+#
+###############################################################################
+#
+# Copyright (c) 2018-2022 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+###############################################################################
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PATH="$(dirname "${0}"):${PATH}"
+
+PROG="${0##*/}"
+
+###############################################################################
+
+always()
+{
+    if ! ${quiet}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+die()
+{
+    echo "${PROG}: ${@}" 1>&2
+    exit 1
+}
+
+maybe()
+{
+    if ${noop}
+    then
+	echo - "${@}" 1>&2
+    else
+	if ! ${quiet}
+	then
+	    echo + "${@}" 1>&2
+	fi
+	"${@}"
+    fi
+}
+
+message()
+{
+    if ! ${quiet}
+    then
+	echo "${PROG}: ${@}" 1>&2
+    fi
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG} [-nq] -f source -t destination account
+
+Moves an AWS account to another parent (another OU or to the root).
+
+Options:
+
+    -f	Source parent (from)
+    -n	Do not move anything (no-op)
+    -q	Do not output AWS commands (quiet)
+    -t	Destination parent (to)
+EOF
+}
+
+###############################################################################
+
+describe_ou()
+{
+    always aws organizations describe-organizational-unit \
+	--organizational-unit-id "${1}" \
+    | jq -r '.OrganizationalUnit | {Name, Id}'
+}
+
+list_ous()
+{
+    local ou
+    for ou in $(
+	always aws organizations list-children \
+	    --parent-id "${1}" \
+	    --child-type ORGANIZATIONAL_UNIT \
+	| jq -r '.Children[] | .Id'
+    )
+    do
+	describe_ou "${ou}"
+	list_ous "${ou}"
+    done
+}
+
+###############################################################################
+
+set -e
+set -u
+
+destination=
+noop=false
+quiet=false
+source=
+
+. "${HOME}/.cloud-tools.rc"
+
+while getopts f:nqt: opt
+do
+    case "${opt}" in
+    f)	source="${OPTARG}";;
+    n)	noop=true;;
+    q)	quiet=true;;
+    t)	destination="${OPTARG}";;
+    *)	usage 1>&2; exit 1;;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+if [ ${#} -ne 1 ]
+then
+    usage 2>&1
+    exit 2
+fi
+
+account="${1}"
+
+umask 077
+
+WRKDIR=$(mktemp -dt ${0##*/}.XXXXX) || exit 1
+trap "rm -rf '${WRKDIR}'" 0 1 3 15
+
+#
+# Look up the account
+#
+
+always aws organizations list-accounts \
+    --query "Accounts[?Name=='${account}']" \
+    > "${WRKDIR}/account-list.json"
+
+account_count="$(jq 'length' < "${WRKDIR}/account-list.json")"
+case "${account_count}" in
+0)
+    die "Account not found!"
+    ;;
+1)
+    ;;
+*)
+    die "Got ${account_count} accounts, instead of just one!"
+    ;;
+esac
+
+account_id="$(jq -r '.[].Id' < "${WRKDIR}/account-list.json")"
+if [ "${account_id}" = "" ]
+then
+    die 'Account ID missing in account list!'
+fi
+
+#
+# Look up the current parent
+#
+
+always aws organizations list-parents \
+    --child-id "${account_id}" \
+| jq -r '.Parents' \
+> "${WRKDIR}/account-parents.json"
+
+parent_count="$(jq 'length' < "${WRKDIR}/account-parents.json")"
+if [ "${parent_count}" -ne 1 ]
+then
+    die "Got ${parent_count} parents, instead of just one!"
+fi
+
+current_parent_id="$(jq -r '.[].Id' < "${WRKDIR}/account-parents.json")"
+
+#
+# Build a list of available parents
+#
+
+always aws organizations list-roots \
+| jq '.Roots[] | {Name, Id}' \
+> "${WRKDIR}/org-parents.json"
+
+for root in $(jq -r '.Id' < "${WRKDIR}/org-parents.json")
+do
+    list_ous "${root}" \
+    >> "${WRKDIR}/org-parents.json"
+done
+
+#
+# Look up the destination parent
+#
+
+destination_parent_id="$(
+    jq -r 'select(.Name == "'"${destination}"'") | .Id' \
+    < "${WRKDIR}/org-parents.json"
+)"
+
+case "${destination_parent_id}" in
+'')
+    die 'Destination parent not found in organization!'
+    ;;
+"${current_parent_id}")
+    message 'Account already has the destination as its parent!'
+    exit 0
+    ;;
+esac
+
+#
+# Look up the source parent
+#
+
+source_parent_id="$(
+    jq -r 'select(.Name == "'"${source}"'") | .Id' \
+    < "${WRKDIR}/org-parents.json"
+)"
+
+case "${source_parent_id}" in
+'')
+    die 'Source parent not found in organization!'
+    ;;
+"${current_parent_id}")
+    ;;
+*)
+    current_parent_name="$(
+	jq -r 'select(.Id == "'"${current_parent_id}"'") | .Name' \
+	< "${WRKDIR}/org-parents.json"
+    )"
+    die "Current parent is '${current_parent_name}' (${current_parent_id})!"
+    ;;
+esac
+
+#
+# Move the account
+#
+
+maybe aws organizations move-account \
+    --account-id "${account_id}" \
+    --source-parent-id "${source_parent_id}" \
+    --destination-parent-id "${destination_parent_id}"
