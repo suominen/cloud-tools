@@ -1,0 +1,228 @@
+#!/bin/sh
+#
+# Create a new AWS account
+#
+# 20180611  Kimmo Suominen
+#
+###############################################################################
+#
+# Copyright (c) 2018-2022 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+###############################################################################
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PROG="${0##*/}"
+
+###############################################################################
+
+billing=ALLOW
+email_template="root+%s@example.com"
+role=OrganizationAccountAccessRole
+
+###############################################################################
+
+die()
+{
+    echo "${PROG}: ${@}" 1>&2
+    if [ -s "${WRKDIR}/output" ]
+    then
+	echo ====
+	cat "${WRKDIR}/output"
+	echo ====
+    fi 1>&2
+    exit 1
+}
+
+get_output()
+{
+    jq -r "${1}" < "${WRKDIR}/output"
+}
+
+maybe()
+{
+    if ${noop}
+    then
+	echo - "${@}" 1>&2
+    else
+	if ! ${quiet}
+	then
+	    echo + "${@}" 1>&2
+	fi
+	"${@}" > "${WRKDIR}/output"
+    fi
+}
+
+message()
+{
+    if ! ${quiet}
+    then
+	echo "${PROG}: ${@}" 1>&2
+    fi
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG} [-nq] account-name
+
+Creates a new AWS account using the AWS Organizations API.
+
+Options:
+
+    -n	Do not create anything (no-op)
+    -q	Do not output AWS commands (quiet)
+EOF
+}
+
+###############################################################################
+
+set -e
+set -u
+
+email_lowercase=false
+noop=false
+quiet=false
+
+. "${HOME}/.cloud-tools.rc"
+
+while getopts lnq opt
+do
+    case "${opt}" in
+    l)	email_lowercase=true;;
+    n)	noop=true;;
+    q)	quiet=true;;
+    *)	usage 1>&2; exit 1;;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+if [ ${#} -ne 1 ]
+then
+    usage 2>&1
+    exit 2
+fi
+
+account="${1}"
+
+umask 077
+
+WRKDIR=$(mktemp -dt ${0##*/}.XXXXX) || exit 1
+trap "rm -rf '${WRKDIR}'" 0 1 3 15
+
+case "${email_template}" in
+*@example.com)
+    die 'Please configure your email address!'
+    ;;
+esac
+
+case "${account}" in
+[A-Z][a-z][a-z][a-z]*)
+    # Enterprise account
+    ;;
+dev-*)
+    case "${account}" in
+    *[A-Z]*)
+	die 'Uppercase letters are not allowed in developer account names!'
+	;;
+    esac
+    ;;
+p-*)
+    case "${account}" in
+    *[A-Z]*)
+	die 'Uppercase letters are not allowed in project account names!'
+	;;
+    *-cicd|*-dev|*-qa|*-prod|*-dr)
+	# Project CI/CD
+	# Project Development
+	# Project Staging
+	# Project Production
+	# Project Recovery
+	;;
+    *)
+	die 'Please check the naming convention for project accounts!'
+	;;
+    esac
+    ;;
+*)
+    die 'Please check the naming convention for AWS accounts!'
+    ;;
+esac
+
+if ${email_lowercase}
+then
+    email_extension="$(echo "${account}" | tr ' A-Z' '-a-z')"
+else
+    email_extension="${account}"
+fi
+
+maybe aws organizations create-account \
+    --account-name "${account}" \
+    --email "$(printf "${email_template}" "${email_extension}")" \
+    --role-name "${role}" \
+    --iam-user-access-to-billing "${billing}"
+
+if ! ${noop}
+then
+    req_id="$(get_output .CreateAccountStatus.Id)"
+    if [ -z "${req_id}" ]
+    then
+	die 'No request ID found!'
+    fi
+
+    waiting=true
+    while ${waiting}
+    do
+	req_state="$(get_output .CreateAccountStatus.State)"
+	message "Create Account: ${req_state:-(empty)}"
+	case "${req_state}" in
+	'')
+	    die 'No request state found!'
+	    ;;
+	SUCCEEDED)
+	    waiting=false
+	    ;;
+	*)
+	    maybe aws organizations describe-create-account-status \
+		--create-account-request-id "${req_id}"
+	    ;;
+	esac
+    done
+
+    account_id="$(get_output .CreateAccountStatus.AccountId)"
+    if [ -z "${account_id}" ]
+    then
+	die 'No account ID found!'
+    fi
+    message "New account ID ...: ${account_id}"
+    message "Cross-account role: ${role}"
+fi
