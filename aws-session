@@ -1,0 +1,195 @@
+#!/bin/sh
+#
+# Run a command using temporary AWS credentials in memory.
+#
+# 20180611  Kimmo Suominen
+#
+###############################################################################
+#
+# Copyright (c) 2018-2022 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+###############################################################################
+
+OPATH="${PATH}"
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PROG="${0##*/}"
+
+###############################################################################
+
+die()
+{
+    echo "${PROG}: ${@}" 1>&2
+    exit 1
+}
+
+get_output()
+{
+    jq -r "${1}" < "${WRKDIR}/output"
+}
+
+message()
+{
+    if ! ${quiet}
+    then
+	echo "${PROG}: ${@}" 1>&2
+    fi
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG} [-q] [-a account] -r role [-s session]
+		[-C | -S | command [args ...]]
+
+Obtain temporary AWS credentials and run a command or output them. If no
+command is provided, run the user's shell.
+
+Options:
+
+    -a	Account ID
+    -q	Do not output the assumed role ARN (quiet)
+    -r	Role name
+    -s	Session string ($(id -un)@$(hostname))
+
+    -C	Output environment variables for eval in C Shell
+    -S	Output environment variables for eval in Bourne Shell
+EOF
+}
+
+###############################################################################
+
+set -e
+set -u
+
+account=
+role=
+session="$(id -un)@$(hostname)"
+
+. "${HOME}/.cloud-tools.rc"
+
+output_for_eval=
+quiet=false
+
+while getopts CSa:qr:s: opt
+do
+    case "${opt}" in
+    C)	output_for_eval=csh;;
+    S)	output_for_eval=sh;;
+    a)	account="${OPTARG}";;
+    q)	quiet=true;;
+    r)	role="${OPTARG}";;
+    s)	session="${OPTARG}";;
+    *)	usage 1>&2; exit 1;;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+if [ ${#} -lt 1 ]
+then
+    set -- "${SHELL}"
+fi
+
+umask 077
+
+WRKDIR=$(mktemp -dt ${0##*/}.XXXXX) || exit 1
+trap "rm -rf '${WRKDIR}'" 0 1 3 15
+
+if [ -z "${role}" ]
+then
+    die 'Provide a role name!'
+fi
+
+case "${account}" in
+'')
+    account=$(aws sts get-caller-identity | jq -r .Account)
+    if [ -z "${account}" ]
+    then
+	die 'Cannot determine caller identity!'
+    fi
+    ;;
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+    # Looks ok (12 digits)
+    ;;
+*)
+    account="$(
+	aws organizations list-accounts \
+	    --query "Accounts[?Name=='${account}']" \
+	| jq -r '.[].Id'
+    )"
+    case "${account}" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+	# Looks ok (12 digits)
+	;;
+    *)
+	die 'Provide a numeric account ID or a valid account name!'
+	;;
+    esac
+    ;;
+esac
+
+aws sts assume-role \
+    --role-arn "arn:aws:iam::${account}:role/${role}" \
+    --role-session-name "${session}" \
+    > "${WRKDIR}/output"
+
+AWS_ACCESS_KEY_ID="$(get_output .Credentials.AccessKeyId)"
+export AWS_ACCESS_KEY_ID
+
+AWS_SECRET_ACCESS_KEY="$(get_output .Credentials.SecretAccessKey)"
+export AWS_SECRET_ACCESS_KEY
+
+AWS_SESSION_TOKEN="$(get_output .Credentials.SessionToken)"
+export AWS_SESSION_TOKEN
+
+message "Assumed $(get_output .AssumedRoleUser.Arn)"
+
+rm -rf "${WRKDIR}"
+
+case "${output_for_eval}" in
+csh)
+    printf "setenv AWS_ACCESS_KEY_ID '%s';\n" "${AWS_ACCESS_KEY_ID}"
+    printf "setenv AWS_SECRET_ACCESS_KEY '%s';\n" "${AWS_SECRET_ACCESS_KEY}"
+    printf "setenv AWS_SESSION_TOKEN '%s';\n" "${AWS_SESSION_TOKEN}"
+    ;;
+sh)
+    printf "export AWS_ACCESS_KEY_ID='%s';\n" "${AWS_ACCESS_KEY_ID}"
+    printf "export AWS_SECRET_ACCESS_KEY='%s';\n" "${AWS_SECRET_ACCESS_KEY}"
+    printf "export AWS_SESSION_TOKEN='%s';\n" "${AWS_SESSION_TOKEN}"
+    ;;
+*)
+    # Run the command using the caller's PATH.
+    PATH="${OPATH}"
+    exec "$@"
+    ;;
+esac
