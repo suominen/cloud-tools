@@ -1,0 +1,288 @@
+#!/bin/sh
+#
+# Show the latest version of a managed policy in AWS IAM.
+#
+# 20230109  Kimmo Suominen
+#
+###############################################################################
+#
+# Copyright (c) 2023 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+###############################################################################
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PATH="$(dirname "${0}"):${PATH}"
+
+PROG="${0##*/}"
+
+AWS_DEFAULT_OUTPUT=json
+export AWS_DEFAULT_OUTPUT
+
+###############################################################################
+
+always()
+{
+    if ! ${quiet}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+die()
+{
+    echo "${PROG}: ${@}" 1>&2
+    exit 1
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG} [-jqy] policy [version]
+	${PROG} -c [-jqy] policy [old [new]]
+
+Shows the specified version of a managed policy, or compares two policy
+versions.
+
+The version to show defaults to the default version of the policy.
+
+When comparing, the new version defaults to the default version of the
+policy.  The old version defaults to the most recent non-default version
+of the policy.
+
+Options:
+
+    -c	Compare policy versions
+    -j	Show policy in JSON format
+    -q	Do not output AWS commands (quiet)
+    -y	Show policy in YAML format (default)
+EOF
+}
+
+###############################################################################
+
+set -eu
+
+mode=show
+output=yaml
+quiet=false
+
+. "${HOME}/.cloud-tools.rc"
+
+while getopts cjqy opt
+do
+    case "${opt}" in
+    c)	mode=compare;;
+    j)	output=json;;
+    q)	quiet=true;;
+    y)	output=yaml;;
+    *)	usage 1>&2; exit 1;;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+case "${mode}" in
+compare)
+    if [ ${#} -lt 1 ] || [ ${#} -gt 3 ]
+    then
+	usage 2>&1
+	exit 2
+    fi
+    ;;
+*)
+    if [ ${#} -lt 1 ] || [ ${#} -gt 2 ]
+    then
+	usage 2>&1
+	exit 2
+    fi
+    ;;
+esac
+
+umask 077
+
+WRKDIR=$(mktemp -dt ${0##*/}.XXXXX) || exit 1
+trap "rm -rf '${WRKDIR}'" 0 1 3 15
+
+case "${1}" in
+arn:*)
+    policy_arn="${1}"
+
+    always aws iam get-policy \
+	--policy-arn "${policy_arn}" \
+	> "${WRKDIR}/policy-metadata.json"
+
+    policy_count="$(jq 'length' < "${WRKDIR}/policy-metadata.json")"
+    case "${policy_count}" in
+    0)
+	die 'Policy not found!'
+	;;
+    1)
+	policy_name="$(jq -r '.Policy.PolicyName' < "${WRKDIR}/policy-metadata.json")"
+	default_version="$(
+	    jq -r '.Policy.DefaultVersionId' \
+	    < "${WRKDIR}/policy-metadata.json"
+	)"
+	;;
+    *)
+	die "Got ${policy_count} results, instead of just one!"
+	;;
+    esac
+    ;;
+*)
+    policy_name="${1}"
+
+    always aws iam list-policies \
+	--scope All \
+	--query "Policies[?PolicyName=='${policy_name}']" \
+	> "${WRKDIR}/policy-metadata.json"
+
+    policy_count="$(jq 'length' < "${WRKDIR}/policy-metadata.json")"
+    case "${policy_count}" in
+    0)
+	die 'Policy not found!'
+	;;
+    1)
+	policy_arn="$(jq -r '.[].Arn' < "${WRKDIR}/policy-metadata.json")"
+	default_version="$(
+	    jq -r '.[].DefaultVersionId' \
+	    < "${WRKDIR}/policy-metadata.json"
+	)"
+	;;
+    *)
+	die "Got ${policy_count} results, instead of just one!"
+	;;
+    esac
+    ;;
+esac
+
+case "${mode}" in
+compare)
+    case ${#} in
+    1)
+	always aws iam list-policy-versions \
+	    --policy-arn "${policy_arn}" \
+	> "${WRKDIR}/policy-versions.json"
+
+	old_version="$(
+	    jq -r '
+		.Versions
+		| map(select(.IsDefaultVersion == false))
+		| first
+		| .VersionId
+	    ' < "${WRKDIR}/policy-versions.json"
+	)"
+
+	new_version="${default_version}"
+	;;
+    2)
+	old_version="${2}"
+	new_version="${default_version}"
+	;;
+    3)
+	old_version="${2}"
+	new_version="${3}"
+	;;
+    esac
+
+    always aws iam get-policy-version \
+	--policy-arn "${policy_arn}" \
+	--version-id "${old_version}" \
+    | jq -r '.PolicyVersion.Document' \
+    | jq -S . > "${WRKDIR}/${old_version}.json"
+
+    if [ ! -s "${WRKDIR}/${old_version}.json" ]
+    then
+	die 'Could not retrieve old policy!'
+    fi
+    ;;
+*)
+    case ${#} in
+    1)
+	new_version="${default_version}"
+	;;
+    2)
+	new_version="${2}"
+	;;
+    esac
+    ;;
+esac
+
+always aws iam get-policy-version \
+    --policy-arn "${policy_arn}" \
+    --version-id "${new_version}" \
+| jq -r '.PolicyVersion.Document' \
+| jq -S . > "${WRKDIR}/${new_version}.json"
+
+if [ ! -s "${WRKDIR}/${new_version}.json" ]
+then
+    case "${mode}" in
+    compare)
+	die 'Could not retrieve new policy!'
+	;;
+    *)
+	die 'Could not retrieve policy!'
+	;;
+    esac
+fi
+
+case "${mode}" in
+compare)
+    case "${output}" in
+    json)
+	;;
+    *)
+	j2y < "${WRKDIR}/${old_version}.json" > "${WRKDIR}/${old_version}.yaml"
+	j2y < "${WRKDIR}/${new_version}.json" > "${WRKDIR}/${new_version}.yaml"
+	;;
+    esac
+    diff -u \
+	"${WRKDIR}/${old_version}.${output}" \
+	"${WRKDIR}/${new_version}.${output}" \
+    ;;
+*)
+    case "${output}" in
+    json)
+	;;
+    *)
+	j2y < "${WRKDIR}/${new_version}.json" > "${WRKDIR}/${new_version}.yaml"
+	;;
+    esac
+    cat "${WRKDIR}/${new_version}.${output}"
+    ;;
+esac \
+| if [ -t 1 ]
+then
+    "${PAGER:-less}"
+else
+    cat
+fi
