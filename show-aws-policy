@@ -65,6 +65,40 @@ die()
 
 ###############################################################################
 
+# jq normalize code
+# by Peter Koppstein (https://stackoverflow.com/users/997358/peak)
+# https://stackoverflow.com/questions/38257725/how-can-i-completely-sort-arbitrary-json-using-jq
+# License: https://creativecommons.org/licenses/by-sa/4.0/
+
+get_policy_version()
+{
+    local arn version
+
+    arn="${1}"
+    version="${2}"
+
+    always aws iam get-policy-version \
+	--policy-arn "${arn}" \
+	--version-id "${version}" \
+    | jq -r '
+	# Apply f to composite entities recursively using keys[], and to atoms
+	def sorted_walk(f):
+	    . as $in
+	    | if type == "object" then
+		reduce keys[] as $key
+		    ( {}; . + { ($key):  ($in[$key] | sorted_walk(f)) } ) | f
+	    elif type == "array" then map( sorted_walk(f) ) | f
+	    else f
+	    end;
+
+	def normalize: sorted_walk(if type == "array" then sort else . end);
+
+	.PolicyVersion.Document | normalize
+    '
+}
+
+###############################################################################
+
 usage()
 {
     cat <<EOF
@@ -214,11 +248,8 @@ compare)
 	;;
     esac
 
-    always aws iam get-policy-version \
-	--policy-arn "${policy_arn}" \
-	--version-id "${old_version}" \
-    | jq -r '.PolicyVersion.Document' \
-    | jq -S . > "${WRKDIR}/${old_version}.json"
+    get_policy_version "${policy_arn}" "${old_version}" \
+    > "${WRKDIR}/${old_version}.json"
 
     if [ ! -s "${WRKDIR}/${old_version}.json" ]
     then
@@ -237,11 +268,8 @@ compare)
     ;;
 esac
 
-always aws iam get-policy-version \
-    --policy-arn "${policy_arn}" \
-    --version-id "${new_version}" \
-| jq -r '.PolicyVersion.Document' \
-| jq -S . > "${WRKDIR}/${new_version}.json"
+get_policy_version "${policy_arn}" "${new_version}" \
+> "${WRKDIR}/${new_version}.json"
 
 if [ ! -s "${WRKDIR}/${new_version}.json" ]
 then
