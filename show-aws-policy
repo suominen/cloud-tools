@@ -91,9 +91,12 @@ get_policy_version()
 	    else f
 	    end;
 
-	def normalize: sorted_walk(if type == "array" then sort else . end);
+	def normalize:
+	    sorted_walk(if type == "array" then sort else . end)
+	    | .Statement |= sort_by(.Sid);
 
-	.PolicyVersion.Document | normalize
+	.PolicyVersion.Document
+	| normalize
     '
 }
 
