@@ -69,7 +69,7 @@ message()
 usage()
 {
     cat <<EOF
-Usage:	${PROG} [-q] [-a account] -r role [-s session]
+Usage:	${PROG} [-q] [-a account] [-p profile] [-s session] -r role
 		[-C | -S | command [args ...]]
 
 Obtain temporary AWS credentials and run a command or output them. If no
@@ -78,6 +78,7 @@ command is provided, run the user's shell.
 Options:
 
     -a	Account ID
+    -p	Profile name
     -q	Do not output the assumed role ARN (quiet)
     -r	Role name
     -s	Session string ($(id -un)@$(hostname))
@@ -102,12 +103,13 @@ session="$(id -un)@$(hostname)"
 output_for_eval=
 quiet=false
 
-while getopts CSa:qr:s: opt
+while getopts CSa:p:qr:s: opt
 do
     case "${opt}" in
     C)	output_for_eval=csh;;
     S)	output_for_eval=sh;;
     a)	account="${OPTARG}";;
+    p)	export AWS_PROFILE="${OPTARG}";;
     q)	quiet=true;;
     r)	role="${OPTARG}";;
     s)	session="${OPTARG}";;
