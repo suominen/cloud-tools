@@ -93,6 +93,9 @@ EOF
 set -e
 set -u
 
+AWS_DEFAULT_OUTPUT=json
+export AWS_DEFAULT_OUTPUT
+
 account=
 account_map=
 role=
