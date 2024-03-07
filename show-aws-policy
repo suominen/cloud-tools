@@ -6,7 +6,7 @@
 #
 ###############################################################################
 #
-# Copyright (c) 2023 Kimmo Suominen
+# Copyright (c) 2023-2024 Kimmo Suominen
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -102,11 +102,18 @@ get_policy_version()
 
 ###############################################################################
 
+j2y()
+{
+    yq -y --indentless "${@}"
+}
+
+###############################################################################
+
 usage()
 {
     cat <<EOF
-Usage:	${PROG} [-jqy] policy [version]
-	${PROG} -c [-jqy] policy [old [new]]
+Usage:	${PROG} [-jqy] [-p profile] policy [version]
+	${PROG} -c [-jqy] [-p profile] policy [old [new]]
 
 Shows the specified version of a managed policy, or compares two policy
 versions.
@@ -121,6 +128,7 @@ Options:
 
     -c	Compare policy versions
     -j	Show policy in JSON format
+    -p	Profile name
     -q	Do not output AWS commands (quiet)
     -y	Show policy in YAML format (default)
 EOF
@@ -136,11 +144,12 @@ quiet=false
 
 . "${HOME}/.cloud-tools.rc"
 
-while getopts cjqy opt
+while getopts cjp:qy opt
 do
     case "${opt}" in
     c)	mode=compare;;
     j)	output=json;;
+    p)	export AWS_PROFILE="${OPTARG}";;
     q)	quiet=true;;
     y)	output=yaml;;
     *)	usage 1>&2; exit 1;;
