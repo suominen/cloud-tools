@@ -6,7 +6,7 @@
 #
 ###############################################################################
 #
-# Copyright (c) 2022 Kimmo Suominen
+# Copyright (c) 2022-2024 Kimmo Suominen
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -75,7 +75,11 @@ aws organizations list-accounts \
 	"name": .Name,
 	"status": .Status,
 	"how": .JoinedMethod,
-	"when": .JoinedTimestamp | strflocaltime("%F %T %Z")
+	"when":
+	  .JoinedTimestamp
+	  | sub("\\.\\d+"; "")
+	  | strptime("%Y-%m-%dT%H:%M:%S%Z")
+	  | strflocaltime("%F %T %Z")
     })
     | sort_by(.when)
     | map(join(","))
