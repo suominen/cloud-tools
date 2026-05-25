@@ -123,6 +123,7 @@ Modes:
 
 Options:
 
+    -b	Bucket (upload target and CloudFront distribution origin).
     -h	Show this help.
     -n	No-op.  Print but do not execute state-changing AWS calls.
     -p	AWS profile (overrides AWS_PROFILE from the environment).
@@ -163,7 +164,7 @@ case "${cdn_profile:-}" in
 *)  export AWS_PROFILE="${cdn_profile}";;
 esac
 
-while getopts ILUb:hnp:qr:v opt
+while getopts ILUb:hnp:qv opt
 do
     case "${opt}" in
     I)	mode=invalidate_only;;
