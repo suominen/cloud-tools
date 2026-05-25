@@ -1,0 +1,448 @@
+#!/bin/sh
+#
+# Upload files to a CDN-fronted S3 bucket and (optionally)
+# create matching CloudFront cache invalidations.
+#
+# 20260525  Kimmo Suominen
+#
+
+#
+# Copyright (c) 2026 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PROG="${0##*/}"
+
+AWS_DEFAULT_OUTPUT=json
+export AWS_DEFAULT_OUTPUT
+
+###############################################################################
+
+cdn_bucket=
+cdn_bucket_prefix=
+cdn_distribution_id=
+cdn_invalidation_limit=50
+
+###############################################################################
+
+always()
+{
+    if ${verbose}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+die()
+{
+    echo "${PROG}: ${*}" 1>&2
+    exit 1
+}
+
+maybe()
+{
+    if ${noop}
+    then
+	echo - "${@}" 1>&2
+	return 0
+    fi
+    if ${verbose}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+message()
+{
+    if ! ${quiet}
+    then
+	echo "${PROG}: ${*}" 1>&2
+    fi
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG}    [-hnqv] [-p profile] -b bucket file [file ...] s3-prefix/
+	${PROG} -U [-hnqv] [-p profile] -b bucket file [file ...] s3-prefix/
+	${PROG} -I [-hnqv] [-p profile] -b bucket path [path ...]
+	${PROG} -L [-hqv]  [-p profile] -b bucket
+
+Upload files to a CDN-fronted S3 bucket and create matching
+CloudFront cache invalidations.
+
+In the default form each file is uploaded to s3-prefix/<basename>
+and a single invalidation is issued covering all uploaded paths.
+The operation is refused when the number of files exceeds the
+configured invalidation limit (default 50) -- use -U + -I instead.
+
+s3-prefix and -I paths are CloudFront-shaped: leading "/" is
+required.  A trailing "/" on an -I path stands for "everything
+under this prefix" -- the script appends "*" before submitting.
+Upload modes require a trailing "/" on the prefix.
+
+Modes:
+
+    -I	Invalidate only.  Each remaining argument is a CloudFront
+	path (with or without a trailing "/").
+    -L	List existing invalidations.
+    -U	Upload only; do not invalidate.
+
+Options:
+
+    -h	Show this help.
+    -n	No-op.  Print but do not execute state-changing AWS calls.
+    -p	AWS profile (overrides AWS_PROFILE from the environment).
+    -q	Quiet.  Suppress per-action progress messages.
+    -v	Verbose.  Print each AWS command before it runs.
+
+Configuration is read from ~/.cloud-tools.rc:
+
+    cdn_bucket			Optional.  Content bucket name.
+				If configured, the "-b bucket" option
+				becomes optional.
+    cdn_bucket_prefix		Optional.  Prepended to every S3 key.
+    cdn_distribution_id		Optional.  Pin the CloudFront
+				distribution; otherwise it is
+				discovered from the bucket origin.
+    cdn_invalidation_limit	Optional.  Default 50.
+    cdn_profile			Optional.  AWS profile to use.
+EOF
+}
+
+###############################################################################
+
+set -e
+set -u
+
+mode=upload_invalidate
+noop=false
+quiet=false
+verbose=false
+
+# shellcheck source=/dev/null
+. "${HOME}/.cloud-tools.rc"
+
+bucket="${cdn_bucket:-}"
+
+case "${cdn_profile:-}" in
+'') ;;
+*)  export AWS_PROFILE="${cdn_profile}";;
+esac
+
+while getopts ILUb:hnp:qr:v opt
+do
+    case "${opt}" in
+    I)	mode=invalidate_only;;
+    L)	mode=list;;
+    U)	mode=upload_only;;
+    b)	bucket="${OPTARG}";;
+    h)	usage; exit 0;;
+    n)	noop=true;;
+    p)	export AWS_PROFILE="${OPTARG}";;
+    q)	quiet=true; verbose=false;;
+    v)	verbose=true; quiet=false;;
+    *)	usage 1>&2; exit 2;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if ${noop} && [ "${mode}" = list ]
+then
+    die '-n is not meaningful with -L (read-only mode)'
+fi
+
+# Argument-count and shape checks.
+case "${mode}" in
+list)
+    if [ ${#} -ne 0 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    ;;
+invalidate_only)
+    if [ ${#} -lt 1 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    for p
+    do
+	case "${p}" in
+	/*) ;;
+	*)  die "invalidation path must start with /: ${p}";;
+	esac
+    done
+    ;;
+upload_invalidate|upload_only)
+    if [ ${#} -lt 2 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    # The last positional is the destination prefix.
+    prefix=
+    for arg
+    do
+	prefix="${arg}"
+    done
+    case "${prefix}" in
+    /*/) ;;
+    *)   die "upload prefix must start with / and end with /: ${prefix}";;
+    esac
+    ;;
+esac
+
+# Required-config checks.
+case "${mode}" in
+upload_invalidate|upload_only)
+    if [ -z "${bucket}" ]
+    then
+	die 'bucket is required'
+    fi
+    ;;
+esac
+case "${mode}" in
+upload_invalidate|invalidate_only|list)
+    if [ -z "${cdn_distribution_id}" ] && [ -z "${bucket}" ]
+    then
+	die 'bucket (or cdn_distribution_id) is required'
+    fi
+    ;;
+esac
+
+# Dependency checks.
+command -v aws > /dev/null ||
+die 'aws CLI is required'
+command -v jq > /dev/null ||
+die 'jq is required'
+if [ "${mode}" = list ]
+then
+    command -v column > /dev/null ||
+    die 'column is required'
+fi
+
+# Look up the bucket region
+case "${bucket:-}" in
+'') ;;
+*)  bucket_region=$(
+	always aws s3api get-bucket-location --bucket "${bucket}" |
+	jq -r .LocationConstraint
+    )
+    if [ -z "${bucket_region}" ]
+    then
+	die "no region found for ${bucket}"
+    fi
+    ;;
+esac
+
+# Resolve the CloudFront distribution (used by every mode except -U).
+case "${mode}" in
+upload_invalidate|invalidate_only|list)
+    if [ -n "${cdn_distribution_id}" ]
+    then
+	distribution_id="${cdn_distribution_id}"
+    else
+	bucket_domain="${bucket}.s3.${bucket_region}.amazonaws.com"
+	distribution_id=$(
+	    always aws cloudfront list-distributions |
+	    jq -r --arg bd "${bucket_domain}" '
+		.DistributionList.Items // []
+		| map(select(
+		    .Origins.Items // []
+		    | map(.DomainName)
+		    | index($bd)
+		  ))
+		| .[].Id
+	    '
+	)
+	if [ -z "${distribution_id}" ]
+	then
+	    die "no CloudFront distribution found for ${bucket} in ${bucket_region}"
+	fi
+	if [ "$(echo "${distribution_id}" | wc -l)" -gt 1 ]
+	then
+	    cat <<EOF 1>&2
+${PROG}: Multiple matching CloudFront distributions found.
+
+Multiple CloudFront distributions reference ${bucket}.
+Setting cdn_distribution_id in ~/.cloud-tools.rc is required.
+EOF
+	    exit 1
+	fi
+    fi
+    ;;
+esac
+
+# Strip any leading / trailing slash from the configured bucket prefix
+# so we can join it cleanly with the user-supplied path below.
+normalized_bp="${cdn_bucket_prefix#/}"
+normalized_bp="${normalized_bp%/}"
+
+case "${mode}" in
+list)
+    always aws cloudfront list-invalidations \
+	--distribution-id "${distribution_id}" |
+    jq -r '
+	.InvalidationList.Items
+	| sort_by(.CreateTime)
+	| map([
+	    .Id,
+	    .Status,
+	    (.CreateTime
+	      | sub("\\.\\d+"; "")
+	      | strptime("%Y-%m-%dT%H:%M:%S%Z")
+	      | strflocaltime("%F %T %Z"))
+	  ])
+	| map(join(","))
+	| .[]
+    ' |
+    sed '1 i\
+ID,STATUS,CREATED
+' |
+    column -s, -t
+    ;;
+invalidate_only)
+    # Apply the trailing-"/" -> "*" rule, building the path list in
+    # "$@" so embedded spaces survive intact through to "aws ...
+    # --paths".  The first iteration replaces the input positionals;
+    # later iterations append.
+    i=0
+    for p
+    do
+	i=$(( i + 1 ))
+	case "${p}" in
+	*/) cf="${p}*";;
+	*)  cf="${p}";;
+	esac
+	if [ "${i}" -eq 1 ]
+	then
+	    set -- "${cf}"
+	else
+	    set -- "$@" "${cf}"
+	fi
+    done
+    for p
+    do
+	message "invalidate ${p}"
+    done
+    maybe aws cloudfront create-invalidation \
+	--no-cli-pager \
+	--distribution-id "${distribution_id}" \
+	--paths "$@"
+    ;;
+upload_invalidate|upload_only)
+    file_count=$(( ${#} - 1 ))
+    if [ "${mode}" = upload_invalidate ] &&
+       [ "${file_count}" -gt "${cdn_invalidation_limit}" ]
+    then
+	cat <<EOF 1>&2
+${PROG}: ${file_count} files exceeds the invalidation limit of ${cdn_invalidation_limit}.
+
+For bulk uploads, upload without invalidation, then issue a
+single invalidation that covers the destination:
+
+    ${PROG} -U <files> ${prefix}
+    ${PROG} -I ${prefix}
+
+The trailing slash on the -I path tells the script to invalidate
+everything under that prefix.
+EOF
+	exit 1
+    fi
+
+    # Verify every file is readable before any upload.  The last
+    # positional is the destination prefix; everything before it is
+    # a file path.
+    n=${#}
+    i=0
+    for file
+    do
+	i=$(( i + 1 ))
+	if [ "${i}" -ge "${n}" ]
+	then
+	    break
+	fi
+	[ -r "${file}" ] || die "cannot read file: ${file}"
+    done
+
+    # Upload each file; build the matching CloudFront path list in
+    # "$@" so embedded spaces survive intact through to "aws ...
+    # --paths".  The first upload replaces the input positionals;
+    # later uploads append.
+    prefix_rel="${prefix#/}"
+    i=0
+    uploaded=0
+    for file
+    do
+	i=$(( i + 1 ))
+	if [ "${i}" -ge "${n}" ]
+	then
+	    break
+	fi
+	base="${file##*/}"
+	s3_key="${normalized_bp:+${normalized_bp}/}${prefix_rel}${base}"
+	cf_path="/${s3_key}"
+
+	message "upload ${file} -> s3://${bucket}/${s3_key}"
+	maybe aws s3 cp --quiet \
+	    --region "${bucket_region}" \
+	    "${file}" \
+	    "s3://${bucket}/${s3_key}"
+
+	uploaded=$(( uploaded + 1 ))
+	if [ "${uploaded}" -eq 1 ]
+	then
+	    set -- "${cf_path}"
+	else
+	    set -- "$@" "${cf_path}"
+	fi
+    done
+
+    if [ "${mode}" = upload_invalidate ]
+    then
+	for p
+	do
+	    message "invalidate ${p}"
+	done
+	maybe aws cloudfront create-invalidation \
+	    --no-cli-pager \
+	    --distribution-id "${distribution_id}" \
+	    --paths "$@"
+    fi
+    ;;
+esac
