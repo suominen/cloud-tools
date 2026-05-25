@@ -363,7 +363,23 @@ invalidate_only)
     maybe aws cloudfront create-invalidation \
 	--no-cli-pager \
 	--distribution-id "${distribution_id}" \
-	--paths "$@"
+	--paths "$@" |
+    jq -r '
+	.Invalidation
+	| [
+	    .Id,
+	    .Status,
+	    (.CreateTime
+	      | sub("\\.\\d+"; "")
+	      | strptime("%Y-%m-%dT%H:%M:%S%Z")
+	      | strflocaltime("%F %T %Z"))
+	  ]
+	| join(",")
+    ' |
+    sed '1 i\
+ID,STATUS,CREATED
+' |
+    column -s, -t
     ;;
 upload_invalidate|upload_only)
     file_count=$(( ${#} - 1 ))
@@ -442,7 +458,23 @@ EOF
 	maybe aws cloudfront create-invalidation \
 	    --no-cli-pager \
 	    --distribution-id "${distribution_id}" \
-	    --paths "$@"
+	    --paths "$@" |
+	jq -r '
+	    .Invalidation
+	    | [
+		.Id,
+		.Status,
+		(.CreateTime
+		  | sub("\\.\\d+"; "")
+		  | strptime("%Y-%m-%dT%H:%M:%S%Z")
+		  | strflocaltime("%F %T %Z"))
+	      ]
+	    | join(",")
+	' |
+	sed '1 i\
+ID,STATUS,CREATED
+' |
+	column -s, -t
     fi
     ;;
 esac
