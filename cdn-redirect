@@ -1,0 +1,372 @@
+#!/bin/sh
+#
+# Maintain the redirect table of a CDN-fronted site: a request for
+# a removed path answers a 301 redirect to its replacement.
+#
+# 20261028  Kimmo Suominen
+#
+
+#
+# Copyright (c) 2026 Kimmo Suominen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+
+# local is supported by both NetBSD sh and dash, the portability targets.
+# shellcheck disable=SC3043
+
+PATH="${HOME}/bin/share:${HOME}/.local/bin"
+PATH="${PATH}":/usr/local/bin:/opt/local/bin:/usr/pkg/bin:/bin:/usr/bin
+export PATH
+
+PROG="${0##*/}"
+
+AWS_DEFAULT_OUTPUT=json
+export AWS_DEFAULT_OUTPUT
+
+###############################################################################
+
+cdn_redirect_store=
+
+###############################################################################
+
+always()
+{
+    if ${verbose}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+die()
+{
+    echo "${PROG}: ${*}" 1>&2
+    exit 1
+}
+
+maybe()
+{
+    if ${noop}
+    then
+	echo - "${@}" 1>&2
+	return 0
+    fi
+    if ${verbose}
+    then
+	echo + "${@}" 1>&2
+    fi
+    "${@}"
+}
+
+message()
+{
+    if ! ${quiet}
+    then
+	echo "${PROG}: ${*}" 1>&2
+    fi
+}
+
+# Keys and values are exact request paths: site-relative, no
+# whitespace, no query string or fragment.
+check_path()
+{
+    case "${1}" in
+    /*) ;;
+    *)  die "path must start with /: ${1}";;
+    esac
+    case "${1}" in
+    *[[:space:]?#]*)
+	die "path must not contain whitespace, ? or #: ${1}"
+	;;
+    esac
+}
+
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+Usage:	${PROG} [-hnqv] [-p profile] [-s store] add old-path new-path
+	${PROG} [-hqv]  [-p profile] [-s store] ls
+	${PROG} [-hnqv] [-p profile] [-s store] rm old-path
+
+Maintain the redirect table of a CDN-fronted site.  A request for
+old-path answers a 301 redirect to new-path on the same site.  Both
+paths are site-relative and start with "/", for example
+/Product_Doc/TSX221K_PB.pdf.
+
+The table is a CloudFront KeyValueStore read by the site's edge
+function.  A change is live within seconds; no cache invalidation
+is needed.
+
+Subcommands:
+
+    add		Add a redirect.  Refuses to replace an existing
+		entry -- rm it first.
+    ls, list	List all redirects.
+    rm, remove	Remove a redirect.
+
+Options:
+
+    -h	Show this help.
+    -n	No-op.  Print but do not execute state-changing AWS calls.
+    -p	AWS profile (overrides AWS_PROFILE from the environment).
+    -q	Quiet.  Suppress per-action progress messages.
+    -s	KeyValueStore name (overrides cdn_redirect_store).
+    -v	Verbose.  Print each AWS command before it runs.
+
+Configuration is read from ~/.cloud-tools.rc:
+
+    cdn_profile		Optional.  AWS profile to use (overrides
+			AWS_PROFILE from the environment).
+    cdn_redirect_store	Optional.  KeyValueStore name.  If
+			configured, the "-s store" option becomes
+			optional.
+EOF
+}
+
+###############################################################################
+
+set -e
+set -u
+
+noop=false
+quiet=false
+verbose=false
+
+# shellcheck source=/dev/null
+. "${HOME}/.cloud-tools.rc"
+
+store="${cdn_redirect_store:-}"
+
+case "${cdn_profile:-}" in
+'') ;;
+*)  export AWS_PROFILE="${cdn_profile}";;
+esac
+
+while getopts hnp:qs:v opt
+do
+    case "${opt}" in
+    h)	usage; exit 0;;
+    n)	noop=true;;
+    p)	export AWS_PROFILE="${OPTARG}";;
+    q)	quiet=true; verbose=false;;
+    s)	store="${OPTARG}";;
+    v)	verbose=true; quiet=false;;
+    *)	usage 1>&2; exit 2;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ ${#} -lt 1 ]
+then
+    usage 1>&2
+    exit 2
+fi
+mode="${1}"
+shift
+
+case "${mode}" in
+list)   mode='ls';;
+remove) mode='rm';;
+esac
+
+# Argument-count and shape checks.
+case "${mode}" in
+add)
+    if [ ${#} -ne 2 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    old="${1}"
+    new="${2}"
+    check_path "${old}"
+    check_path "${new}"
+    if [ "${old}" = "${new}" ]
+    then
+	die "old-path and new-path are the same: ${old}"
+    fi
+    ;;
+ls)
+    if [ ${#} -ne 0 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    if ${noop}
+    then
+	die '-n is not meaningful with ls (read-only)'
+    fi
+    ;;
+rm)
+    if [ ${#} -ne 1 ]
+    then
+	usage 1>&2
+	exit 2
+    fi
+    old="${1}"
+    check_path "${old}"
+    ;;
+*)
+    usage 1>&2
+    exit 2
+    ;;
+esac
+
+# Required-config checks.
+if [ -z "${store}" ]
+then
+    die 'store is required'
+fi
+
+# Dependency checks.
+command -v aws > /dev/null ||
+die 'aws CLI is required'
+command -v jq > /dev/null ||
+die 'jq is required'
+if [ "${mode}" = ls ]
+then
+    command -v column > /dev/null ||
+    die 'column is required'
+fi
+
+# AWS calls are captured into a variable before jq looks at them, so
+# that set -e sees the aws exit status instead of jq's.
+
+# Resolve the store name to its ARN (control plane).  The data-plane
+# calls below all take the ARN.
+kvs_json=$(always aws cloudfront describe-key-value-store --name "${store}")
+kvs_arn=$(printf '%s\n' "${kvs_json}" | jq -r '.KeyValueStore.ARN')
+if [ -z "${kvs_arn}" ] || [ "${kvs_arn}" = null ]
+then
+    die "no KeyValueStore named ${store}"
+fi
+
+# Every write needs the store's current data-plane ETag.  Fetch it
+# right before the write so a concurrent edit fails the precondition
+# instead of being overwritten.
+current_etag()
+{
+    local json
+    json=$(
+	always aws cloudfront-keyvaluestore describe-key-value-store \
+	    --kvs-arn "${kvs_arn}"
+    )
+    printf '%s\n' "${json}" | jq -r '.ETag'
+}
+
+# Print the value stored for a key.  Returns 1 when there is no such
+# key and 2 when the lookup itself failed (credentials, throttling,
+# ...), with the AWS error on stderr.  Only the exact not-found error
+# counts as "absent" so that a transient failure never lets add
+# overwrite an entry or rm misreport one.
+lookup()
+{
+    local out
+    if ${verbose}
+    then
+	echo + aws cloudfront-keyvaluestore get-key \
+	    --kvs-arn "${kvs_arn}" --key "${1}" 1>&2
+    fi
+    if out=$(
+	aws cloudfront-keyvaluestore get-key \
+	    --kvs-arn "${kvs_arn}" \
+	    --key "${1}" 2>&1
+    )
+    then
+	printf '%s\n' "${out}" | jq -er '.Value'
+	return
+    fi
+    case "${out}" in
+    *ResourceNotFoundException*)
+	return 1
+	;;
+    esac
+    echo "${out}" 1>&2
+    return 2
+}
+
+case "${mode}" in
+ls)
+    items=$(always aws cloudfront-keyvaluestore list-keys --kvs-arn "${kvs_arn}")
+    {
+	echo 'FROM TO'
+	printf '%s\n' "${items}" |
+	jq -r '
+	    .Items // []
+	    | sort_by(.Key)
+	    | .[]
+	    | [.Key, .Value]
+	    | join(" ")
+	'
+    } |
+    column -t
+    ;;
+add)
+    rc=0
+    existing=$(lookup "${old}") || rc=${?}
+    case "${rc}" in
+    0)	die "${old} is already redirected to ${existing} -- rm it first";;
+    1)	;;
+    *)	die "cannot look up ${old}";;
+    esac
+    etag=$(current_etag)
+    if [ -z "${etag}" ]
+    then
+	die "no ETag for ${store}"
+    fi
+    message "redirect ${old} -> ${new}"
+    maybe aws cloudfront-keyvaluestore put-key \
+	--no-cli-pager \
+	--kvs-arn "${kvs_arn}" \
+	--key "${old}" \
+	--value "${new}" \
+	--if-match "${etag}" > /dev/null
+    ;;
+rm)
+    rc=0
+    existing=$(lookup "${old}") || rc=${?}
+    case "${rc}" in
+    0)	;;
+    1)	die "no redirect for ${old}";;
+    *)	die "cannot look up ${old}";;
+    esac
+    etag=$(current_etag)
+    if [ -z "${etag}" ]
+    then
+	die "no ETag for ${store}"
+    fi
+    message "remove redirect ${old} -> ${existing}"
+    maybe aws cloudfront-keyvaluestore delete-key \
+	--no-cli-pager \
+	--kvs-arn "${kvs_arn}" \
+	--key "${old}" \
+	--if-match "${etag}" > /dev/null
+    ;;
+esac
